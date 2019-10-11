@@ -1,0 +1,287 @@
+import com.google.gson.Gson;
+import com.google.gson.annotations.Since;
+import com.vmware.crs.crsmeutils.MachineResource;
+import com.vmware.crs.crsmeutils.SharedHardwareClient;
+import com.vmware.crs.crsmeutils.SharedHardwareConstants;
+import com.vmware.crs.crsmeutils.SharedHardwareRequest;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpStatus;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.utils.URIBuilder;
+import org.apache.http.entity.StringEntity;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import java.util.List;
+import java.util.Map;
+
+public class OldConsumer extends Thread {
+    public static AtomicInteger indexCallCount = new AtomicInteger(0);
+    public static AtomicInteger successIndexCallCount = new AtomicInteger(0);
+    public static AtomicInteger finishedIndexCount = new AtomicInteger(0);
+    public static ConcurrentMap<Integer, Long> indexCallIntervals = new ConcurrentHashMap();
+
+    public static AtomicInteger leaseCallCount = new AtomicInteger(0);
+    public static AtomicInteger successLeaseCallCount = new AtomicInteger(0);
+    public static AtomicInteger finishedLeaseCount = new AtomicInteger(0);
+    public static ConcurrentMap<Integer, Long> leaseCallIntervals = new ConcurrentHashMap();
+
+    public static AtomicInteger allocateCallCount = new AtomicInteger(0);
+    public static AtomicInteger successAllocateCallCount = new AtomicInteger(0);
+    public static AtomicInteger finishedAllocateCount = new AtomicInteger(0);
+    public static ConcurrentMap<Integer, Long> allocateCallIntervals = new ConcurrentHashMap();
+
+    public enum Action { INDEX, LEASE, ALLOCATE }
+
+    final static String  HOST = "10.153.218.120";
+    final static int PORT = 2343;
+    final static int REST_PORT = 8080;
+
+    public static List<MachineResource> getMachines() {
+        SharedHardwareRequest r = new SharedHardwareClient(HOST, PORT).getAllHardware();
+        return r.getResMachineList();
+    }
+
+    private Action action;
+    private String catId;
+    private SharedHardwareClient client;
+    private CloseableHttpClient httpClient = HttpClients.createDefault();
+
+    public OldConsumer(Action action) {
+        this.action = action;
+        this.client = new SharedHardwareClient(HOST, PORT);
+    }
+
+    public OldConsumer(Action action, String catId) {
+        this.action = action;
+        this.catId = catId;
+        this.client = new SharedHardwareClient(HOST, PORT);
+    }
+
+    public void run() {
+        switch (action) {
+            case INDEX:
+                callGetMachines();
+                break;
+            case LEASE:
+                doAllLeaseActions(catId);
+                break;
+            case ALLOCATE:
+                doAllAllocatinRelatedActions();
+                break;
+        }
+    }
+
+    public List<MachineResource> callGetMachines() {
+        indexCallCount.incrementAndGet();
+        List<MachineResource> machines = null;
+        try {
+            long start = System.currentTimeMillis();
+            System.out.println(Thread.currentThread().getName() + " begin to get machines");
+            SharedHardwareRequest r = client.getAllHardware();
+            machines = r.getResMachineList();
+            long offset = System.currentTimeMillis() - start;
+            if(machines != null && machines.size() > 0) {
+                successIndexCallCount.incrementAndGet();
+                indexCallIntervals.put(successIndexCallCount.get(), offset);
+            }
+        } catch (Exception e) {
+            System.out.println(e.getMessage());
+        } finally {
+            finishedIndexCount.incrementAndGet();
+        }
+        return machines;
+    }
+
+    private void doAllLeaseActions(String catId) {
+        leaseCallCount.incrementAndGet();
+        try {
+            long start = System.currentTimeMillis();
+            String user = "yongwenz";
+            System.out.println(Thread.currentThread().getName() + " begin to lease machine " + catId);
+            long token = doSafeLease(catId, user);
+            if (token != 0) {
+                System.out.println(Thread.currentThread().getName() + " begin to extend lease for machine " + catId);
+                token = doSafeExtendLease(catId, String.valueOf(token));
+                if (token != 0) {
+                    System.out.println(Thread.currentThread().getName() + " begin to cancel lease for machine " + catId);
+                    boolean r = doSafeCancelLease(catId, String.valueOf(token));
+                    if(r) {
+                        long offset = System.currentTimeMillis() - start;
+                        successLeaseCallCount.incrementAndGet();
+                        leaseCallIntervals.put(successLeaseCallCount.get(), offset);
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            System.out.println(e.getMessage());
+        } finally {
+            finishedLeaseCount.incrementAndGet();
+        }
+    }
+
+    private void doAllAllocatinRelatedActions() {
+        allocateCallCount.incrementAndGet();
+        try {
+            long start = System.currentTimeMillis();
+            Map<String, String> params = new HashMap<String, String>();
+            params.put("HOST_01_CATID", "");
+            params.put("jobName", "http://crs.eng.vmware.com/job/abc");
+            params.put("HOST_01_DATASTORENAME", "");
+            System.out.println(Thread.currentThread().getName() + " begin to allocate machine");
+            CloseableHttpResponse allocateResponse = allocateMachines(params);
+            if (allocateResponse.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
+                Map<String, Object> responseJson = new Gson().fromJson(
+                        new InputStreamReader(allocateResponse.getEntity().getContent()), Map.class);
+                List<String> catIds = new ArrayList<String>();
+                for(String key : responseJson.keySet()) {
+                    if(key.endsWith("CATID")) {
+                        catIds.add((String)responseJson.get(key));
+                    }
+                }
+
+                String strCatIds = String.join(",", catIds);
+                System.out.println(Thread.currentThread().getName() + " begin to deallocate machine " + strCatIds);
+                CloseableHttpResponse deallocateResponse = deallocate(strCatIds);
+                if (deallocateResponse.getStatusLine().getStatusCode() == HttpStatus.SC_OK) {
+                    long offset = System.currentTimeMillis() - start;
+                    successAllocateCallCount.incrementAndGet();
+                    allocateCallIntervals.put(successAllocateCallCount.get(), offset);
+                }
+            }
+        } catch (Exception e) {
+            System.out.println(e.getMessage());
+        } finally {
+            finishedAllocateCount.incrementAndGet();
+        }
+
+    }
+
+    private long doSafeLease(String catId, String user) {
+        List<MachineResource> machines = getMachines();
+        if (machines == null || machines.isEmpty()) {
+            return 0;
+        }
+
+        List<MachineResource> leaseMachineList = new ArrayList<MachineResource>();
+        for (MachineResource machine : machines) {
+            if (machine.getHwMachine().getCatId().equals(catId)) {
+                if (machine.getHwMachine().isHardwareUsed()) {
+                    break;
+                }
+
+                leaseMachineList.add(machine);
+                machine.getLeaseInfo().setLeasedOwner(user);
+                break;
+            }
+        }
+        SharedHardwareRequest leaseReq = client.leaseMachines(leaseMachineList);
+        if (leaseReq.getNetworkResponse().equals(SharedHardwareConstants.ResponseType.SUCCESS_OK.toString())) {
+            List<MachineResource> leased = leaseReq.getResMachineList();
+            if (leased != null && leased.size() > 0) {
+                return leased.get(0).getLeaseInfo().getLeaseStartTime();
+            }
+        }
+        return 0;
+    }
+
+    private boolean doSafeCancelLease(String catId, String token) {
+        List<MachineResource> machines = getMachines();
+        if (machines == null || machines.isEmpty()) {
+            return false;
+        }
+
+        for (MachineResource machine : machines) {
+            if (machine.getHwMachine().getCatId().equals(catId)) {
+                if (machine.getLeaseInfo().isLeased()
+                        && (machine.getLeaseInfo().getLeaseStartTime() != Long.parseLong(token))) {
+                    break;
+                }
+                List<MachineResource> leasedMachineList = new ArrayList<MachineResource>();
+                leasedMachineList.add(machine);
+
+                SharedHardwareRequest deallocateReq =
+                        client.cancelLeasePeriodOfMachines(leasedMachineList);
+                if (deallocateReq.getNetworkResponse().equals(SharedHardwareConstants.ResponseType.SUCCESS_OK.toString())) {
+                    return true;
+                }
+                break;
+            }
+        }
+        return false;
+    }
+
+    private long doSafeExtendLease(String catId, String token) {
+        List<MachineResource> machines = getMachines();
+        if (machines == null || machines.isEmpty()) {
+            return 0;
+        }
+
+        for (MachineResource machine : machines) {
+            if (machine.getHwMachine().getCatId().equals(catId)) {
+                if (machine.getLeaseInfo().isLeased()
+                        && (machine.getLeaseInfo().getLeaseStartTime() != Long.parseLong(token))) {
+                    break;
+                }
+                List<MachineResource> leasedMachineList = new ArrayList<MachineResource>();
+                leasedMachineList.add(machine);
+
+                SharedHardwareRequest extendLeaseReq =
+                        client.extendLeasePeriodOfMachines(leasedMachineList);
+                if (extendLeaseReq.getNetworkResponse().equals(SharedHardwareConstants.ResponseType.SUCCESS_OK.toString())) {
+                    List<MachineResource> leased = extendLeaseReq.getResMachineList();
+                    if (leased != null && leased.size() > 0) {
+                        return leased.get(0).getLeaseInfo().getLeaseStartTime();
+                    }
+                }
+                break;
+            }
+        }
+        return 0;
+    }
+    private CloseableHttpResponse allocateMachines(Map<String, String> params)
+            throws URISyntaxException, IOException {
+        URI uri = new URIBuilder()
+                .setScheme("http")
+                .setHost(HOST)
+                .setPort(REST_PORT)
+                .setPath("/allocate")
+                .build();
+        HttpPost httpPost = new HttpPost(uri);
+        httpPost.setHeader("Accept", "application/json");
+        httpPost.setHeader("Content-type", "application/json");
+        HttpEntity entity = new StringEntity(new Gson().toJson(params));
+        httpPost.setEntity(entity);
+        CloseableHttpResponse httpResponse = httpClient.execute(httpPost);
+        return httpResponse;
+    }
+
+    private CloseableHttpResponse deallocate(String catIds) throws URISyntaxException, IOException {
+        URI uri = new URIBuilder()
+                .setScheme("http")
+                .setHost(HOST)
+                .setPort(REST_PORT)
+                .setPath("/deallocate")
+                .addParameter("catIds", catIds)
+                .build();
+
+        HttpPost postRequest = new HttpPost(uri);
+        CloseableHttpResponse httpResponse = httpClient.execute(postRequest);
+
+        return httpResponse;
+    }
+
+}
