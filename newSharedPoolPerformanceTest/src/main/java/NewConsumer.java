@@ -1,4 +1,7 @@
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.vmware.crs.crsmeutils.Models.MachineResource;
 import com.vmware.crs.crsmeutils.SharedHardwareClient;
 import org.apache.http.HttpStatus;
@@ -147,12 +150,14 @@ public class NewConsumer extends Thread {
             System.out.println(Thread.currentThread().getName() + " begin to allocate machine");
             CloseableHttpResponse allocateResponse = client.allocateMachines(params);
             if (allocateResponse.getStatusLine().getStatusCode() == HttpStatus.SC_CREATED) {
-                Map<String, Object> responseJson = new Gson().fromJson(
-                        new InputStreamReader(allocateResponse.getEntity().getContent()), Map.class);
+                JsonElement responseJson = new JsonParser().parse(
+                        new InputStreamReader(allocateResponse.getEntity().getContent()));
                 List<String> catIds = new ArrayList<String>();
-                for(String key : responseJson.keySet()) {
+                Map<String, String> jobParameters = new Gson().fromJson(
+                        responseJson.getAsJsonObject().get("jobParameters"), Map.class);
+                for(String key : jobParameters.keySet()) {
                     if(key.endsWith("CATID")) {
-                        catIds.add((String)responseJson.get(key));
+                        catIds.add(jobParameters.get(key));
                     }
                 }
                 System.out.println(Thread.currentThread().getName() + " begin to deallocate machine " + catIds.get(0));
